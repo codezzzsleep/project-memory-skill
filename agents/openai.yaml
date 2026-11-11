@@ -1,0 +1,6 @@
+interface:
+  display_name: "Project Memory"
+  short_description: "Preserve project decisions and recovery checkpoints"
+  default_prompt: "Use $project-memory to recover the project state and checkpoint decisions before continuing."
+policy:
+  allow_implicit_invocation: true
