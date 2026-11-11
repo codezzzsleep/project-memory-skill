@@ -1,63 +1,87 @@
 ---
 name: project-memory
-description: Read and maintain durable project decisions, evidence, live jobs, and recovery checkpoints when continuing work with an active MEMORY.md, migrating repositories, or recovering after context compression. Also use when the user requests persistent project memory.
+description: Use when starting, resuming, or handing off sustained work in a workspace that has a MEMORY.md, after context compression or a crashed session, when migrating repositories, or when the user asks for persistent project memory.
 ---
 
 # Project Memory
 
 Keep the user's purpose, accepted decisions, permissions, evidence, and next executable step recoverable without asking them again. Memory supports the active task; it never replaces a newer user instruction.
 
+A session can end without warning. The safety net is what was written before the dependent work started: a decision in memory, a job identity in its ledger. Nothing that matters waits for an end-of-turn write.
+
 ## Read before acting
 
-Follow the applicable AGENTS.md to locate the authoritative MEMORY.md. Read it before the first project action when starting work, resuming after an interruption, recovering from context compression, or switching workspaces. If no location is designated, locate an existing memory in the project or its workspace before creating one. Keep one authority; use links from other checkouts rather than competing current-state files.
+Follow the applicable AGENTS.md to locate the authoritative MEMORY.md. Read it before the first project action when starting work, resuming after an interruption, recovering from context compression, or switching workspaces. If no location is designated, locate an existing memory in the project or its workspace before creating one. Keep one authority; other checkouts link to it.
 
-Before asking a question or making a consequential workflow choice, consult the relevant memory sections. Reuse recorded authorization and configuration locations. Verify volatile state such as SSH availability, API authentication, or Git head with tools; distinguish a prior successful check from current availability.
+Memory is a lead; tools are proof. After reading, inspect files, ledgers, and running jobs before retrying anything, and re-check every item under Live state. A compressed conversation is also only a lead: it does not show that a job failed, a file disappeared, or a decision was revoked.
 
-Read only the linked evidence needed for the next action. A compressed conversation is a lead, not proof that a job failed, a file disappeared, or an earlier decision was revoked.
+Continue incomplete authorized work. Do not repeat questions, recreate repositories, resubmit known paid tasks, or discard assets because they are absent from the compressed conversation. Before asking a question or making a consequential workflow choice, consult the relevant section first. Read only the linked evidence the next action needs.
 
-## Write at decision boundaries
+## One writer
 
-Update memory immediately when:
+Only the agent currently executing the work writes MEMORY.md. An agent that is reviewing, advising, or answering a status question reads it, and reports any disagreement with what it observes to the user or the executing agent; it writes nothing.
 
-- The user changes the objective, repository, required deliverables, constraints, or authorization.
+Before the first write in a session, check whether another session is still active in the workspace (processes, session logs). If one is, it remains the writer until the user says otherwise.
+
+To write, re-read the file, apply the change, write the result to a temporary file in the same directory, and rename it over MEMORY.md.
+
+## When to write
+
+Write immediately when:
+
+- The user changes the objective, repository, required deliverables, constraints, or authorization. Write the instruction and its reason before the work that depends on it.
 - A design decision changes what will be retained, migrated, removed, or presented. Record its reason.
 - A meaningful implementation stage or verification completes or fails.
-- A paid/external job is created, yields, finishes, or is uncertain. Record its task ID and durable ledger path before continuing; the ledger remains authoritative.
+- A paid or external job is created, yields, finishes, or is uncertain. Its identity goes into its durable ledger as part of creating it; memory points to the ledger, and the ledger stays authoritative.
 - Work switches between local and remote environments or repositories.
-- You are about to end a turn, hand off, or approach context compression.
+- During a long stage, an interruption now would force expensive actions to be repeated.
 
-For a new user decision, write the accepted instruction and its reason before dependent work. For an external job, persist the identity in its durable ledger as part of creating it; then point memory to the ledger. Do not defer the only recovery record until a final response.
+At the end of a turn or before a handoff, compare the file with what changed since the last write. If a decision, job, verification result, or environment changed, write it. If nothing changed, as after a status question or a read-only check, write nothing.
 
-Do not wait for a user reminder. During a long stage without these events, checkpoint when interruption would require repeating expensive actions. A tool yield or a phase transition is an opportunity to check for unrecorded state; do not append a log for every tool call.
+## File shape
 
-## Preserve useful state
+MEMORY.md has these sections, in this order:
 
-Keep memory concise and operational. Record:
+1. **Objective**: what the user wants and why the chosen approach serves it. Required deliverables are listed apart from optional suggestions.
+2. **Authorization**: one entry per grant, in the form given below.
+3. **Standing rules**: constraints, frozen items, and actions that must not be repeated, each with its reason.
+4. **Done, do not redo**: completed stages, each with its verification result and evidence path.
+5. **Live state (as of `<UTC time>`)**: everything that can change while the file stays the same, such as branch head, running jobs, budget counts, disk space, and service availability. Each item names the command or ledger that re-checks it. The section ends with the next concrete action and the remaining acceptance criteria.
+6. **Environment**: active repository, runtime commands, and where credentials are loaded from.
+7. **History**: links to snapshots, reports, and ledgers.
 
-- The objective and why the chosen approach serves it.
-- User decisions and required deliverables, separate from optional suggestions.
-- Authorizations already granted and genuine conditions still missing.
-- The authoritative repository, branch/head, environment, credential file locations, and runtime commands.
-- What actually completed, verification results, and evidence paths.
-- Running jobs, partial mutations, failed attempts, and actions that must not be repeated.
-- The next concrete action and remaining acceptance criteria.
+Every bullet states one fact, in one or two full sentences that a reader who was not in the session can follow.
 
-For repository migrations and showcase work, preserve the agreed retention criteria: which core versions, source snapshots, input assets, generated assets, comparisons, rejected examples, and results must remain available, and why they support the user's presentation. Point to those artifacts. A list of version names alone does not preserve an iteration.
+A changed fact replaces the old statement where it stands. Live state is rewritten as a whole, with a new time, each time any of it changes. MEMORY.md has no running log: an account of what happened, in order, goes into a report or ledger that History links to.
 
-Replace superseded current-state statements instead of repeatedly appending conflicting plans. Separate durable decisions from current status and the next action. Keep a dated checkpoint outside the public repository before substantially condensing existing memory, and link it for recovery. Reference detailed reports and ledgers rather than copying them into every checkpoint.
+When the file passes 150 lines, condense it. First save a dated copy outside any public repository and link it under History.
 
-Never store credential values, tokens, or passwords. Store their location and safe loading instructions. Keep private operational memory outside a public repository; public project status and technical milestones are separate deliverables.
+For repository migrations and showcase work, Standing rules carries the agreed retention criteria: which versions, source snapshots, input assets, generated assets, comparisons, rejected examples, and results must remain available, and why. Point to the artifacts; a list of version names alone does not preserve an iteration.
 
-## Recovery check
+Credential values, tokens, and passwords are never written here; record where they are stored and how to load them. Private operational memory stays outside public repositories; public project status is a separate deliverable.
 
-After reading memory, inspect files and running jobs before retrying. Continue incomplete authorized work. Do not repeat questions, recreate repositories, resubmit known paid tasks, or discard assets because they are absent from the compressed conversation.
+## Authorization entries
 
-When memory and observed state disagree, record the observation and correct current status. Do not erase the user's intent or change the task to fit what happens to be implemented. Only ask about an actual unresolved dependency after checking memory and available evidence.
+Each entry records the user's words, the date, and what the grant covers, including any limit the user stated.
 
-At a checkpoint, confirm that the next reader can identify the active repository, understand why the work is being done this way, find evidence, and execute the next step. “Continue working” alone is not a useful checkpoint.
+Reuse a grant for what it covers without asking again. For an irreversible action the entry does not name, such as deleting data or evidence, rewriting published history, or spending past a recorded cap, ask first. A session that inherits grants names the ones it is relying on in its first report to the user. When the user narrows or withdraws a grant, replace the entry.
 
-## Make reminders discoverable
+## When memory and observation disagree
 
-For a workspace using this skill, maintain a short AGENTS.md entry naming this skill and the authoritative memory path, with the start/resume, decision, job, verification, and end-of-turn triggers. Keep that entry accessible from each active repository. Link private memory from machine-local instructions; keep publishable technical decisions and version evidence in the repository's documentation.
+Record the observation and correct Live state. Do not erase the user's intent or change the task to fit what happens to be implemented. Ask only about an actual unresolved dependency, after checking memory and the available evidence.
 
-This skill provides instructions at work boundaries, not a background timer. Do not claim that installing it creates automatic file writes or guarantees recovery without checkpoints. Read the installed SKILL.md directly in the current session if its catalog has not refreshed.
+## Check before handing off
+
+A reader holding only MEMORY.md and the repository can answer all of these:
+
+- Which repository is active, and why is the work being done this way?
+- What is finished and must not be redone?
+- What is running, and where is its ledger?
+- What is authorized, and by which words?
+- What is the next action? "Continue working" is not an answer.
+
+## Wiring
+
+A workspace using this skill keeps a short AGENTS.md entry that names this skill, the authoritative memory path, and the rule that only the executing agent writes it. Keep that entry reachable from each active repository. Link private memory from machine-local instructions; keep publishable technical decisions and version evidence in the repository's documentation.
+
+This skill gives instructions at work boundaries. It is not a background timer, and installing it does not create automatic file writes or guarantee recovery without checkpoints. If the skill catalog has not refreshed, read the installed SKILL.md directly.
