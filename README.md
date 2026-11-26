@@ -1,82 +1,56 @@
-# project-memory
+# Personal Memory for agents
 
-一个给 Codex 用的技能（skill）：让持续多天、跨多个会话的项目，在上下文被压缩、会话崩溃或换一个会话接手之后，不用再问用户就能接着做下去。
+这个技能让 Agent 在多个项目间恢复工作。新会话先读个人偏好和项目索引，确定目标后才读该项目的记忆与账本。恢复前查现场状态，已提交的外部作业用原 ID 查询，避免重复执行或付费。
 
-它不是后台程序，也不会自动写文件。它是一份写给 agent 的工作约定：什么时候读项目记忆、什么时候写、写什么、哪些东西必须先落盘再动手。
+| 层级 | 文件 | 内容 |
+| --- | --- | --- |
+| L0 | `.agent-memory/SELF.md` | 长期个人偏好、授权边界、本机共用约束，最多 50 行 |
+| L1 | `.agent-memory/PORTFOLIO.md` | 项目目录、唯一记忆路径、状态、优先级和跨项目排期，最多 120 行 |
+| L2 | `MEMORY.md` 与相邻的 `ledger.jsonl` | 项目决策、授权、证据、下一步和外部作业历史 |
 
-## 它解决什么问题
+每份 Markdown 记忆用 YAML `scope` 声明作用域。共享根目录中的 `MEMORY.md` 会触发提示，Agent 通过项目注册表选择记忆。一个项目也可以登记多个工作树，所有工作树共用同一份权威记忆。
 
-长任务里最贵的错误通常不是代码写错，而是恢复时出错：
-
-- 重复提交已经付过费的外部任务；
-- 把已经跑完的实验重跑一遍；
-- 重新问用户早就回答过的问题、早就给过的授权；
-- 因为压缩后的对话里没提到，就以为某个文件或决定不存在了。
-
-这个技能的核心做法是：
-
-1. **先落盘，再做依赖它的事。** 用户的新决定、外部任务的身份，在动手之前就写下来；任务身份写进它自己的账本，记忆只指向账本。
-2. **记忆是线索，工具才是证据。** 恢复时先读记忆，再用工具核实进程、账本、Git 状态，然后才决定要不要重试。
-3. **一个工作区只有一份权威记忆**，其它位置只放指向它的链接。
-
-## 仓库内容
-
-| 文件 | 作用 |
-| --- | --- |
-| `SKILL.md` | 技能正文，agent 实际读的就是它 |
-| `agents/openai.yaml` | Codex 界面里的显示名、简介和默认提示 |
-
-## 安装
-
-仓库根目录就是技能目录，直接克隆到 Codex 的技能目录下：
+## 安装和接线
 
 ```bash
 git clone https://github.com/codezzzsleep/project-memory-skill ~/.codex/skills/project-memory
 ```
 
-## 在工作区里接线
+已有 Git 安装可快进更新。调用名仍是 `$project-memory`。管理脚本使用 Python 3.9+ 标准库和 POSIX 文件锁。在支持 `AGENTS.md` 的其他 Agent 中，可以从本地工作区指令引用 `SKILL.md`。
 
-技能本身不知道你的记忆文件放在哪。在工作区的 `AGENTS.md` 里加一小段，写明技能路径、权威记忆的路径，以及谁可以写它，例如：
-
-```markdown
-# Durable project memory
-
-Use the local `project-memory` skill at `~/.codex/skills/project-memory/SKILL.md`
-and the authoritative `/path/to/workspace/MEMORY.md` for sustained work here.
-Read both before starting or resuming work, especially after context compression.
-Only the agent executing the work writes MEMORY.md; reviewing or advising agents
-read it and report disagreements.
+```bash
+workspace=/absolute/path/to/workspace
+skill_dir="$HOME/.codex/skills/project-memory"
+python3 "$skill_dir/scripts/memory_ctl.py" --workspace-root "$workspace" init-workspace
+python3 "$skill_dir/scripts/memory_ctl.py" --workspace-root "$workspace" init-project example \
+  --repo-path "$workspace/example-repo" --priority high --summary 'Preparing first release'
 ```
 
-`AGENTS.md` 会被这个工作区里的所有 agent 读到，包括只是来查看状态或做评审的。所以这里不要写"每次结束前都更新记忆"这类不分角色的要求，否则旁观的 agent 也会去写。
+在共享工作区的本地 `AGENTS.md` 指明入口和根目录。将示例路径替换为安装和工作区的实际绝对路径。
 
-记忆文件通常含有私有的操作细节（路径、作业、授权），不要放进公开仓库；密钥的值任何时候都不写进去，只写它存放的位置和加载方式。
+```markdown
+# Personal memory
 
-## 记忆文件的形状
+Use the `project-memory` skill at `/path/to/skills/project-memory/SKILL.md`
+for sustained work and recovery. The shared workspace root is `/path/to/workspace`.
+Start with its `.agent-memory/SELF.md` and `.agent-memory/PORTFOLIO.md`.
+At the shared root, never load `MEMORY.md` as global or default project memory.
+Only the executing agent writes the selected project's memory and ledger.
+```
 
-技能要求 `MEMORY.md` 按固定顺序分成七节：
+## 日常管理
 
-| 节 | 内容 |
-| --- | --- |
-| Objective | 用户要什么、为什么这样做；必须交付的和可选建议分开 |
-| Authorization | 每项授权一条：用户原话、日期、覆盖范围和限制 |
-| Standing rules | 约束、冻结项、不能重复的动作，各带原因 |
-| Done, do not redo | 已完成的阶段，各带验证结果和证据路径 |
-| Live state | 一切会自己变化的状态，带时间戳和复核方式；末尾是下一步和剩余验收条件 |
-| Environment | 活跃仓库、运行命令、凭据从哪里加载 |
-| History | 指向快照、报告、账本的链接 |
+- `route` 在登记目录内自动选择项目。共享根目录可传 `--project <slug>`，或让命令返回候选和优先级。已选中项目时，结果包含该项目的记忆路径和未终结作业。
+- `validate` 检查全部登记和归档，报告无效元数据、缺失文件、重复路径、超行以及共享根目录的遗留 `MEMORY.md`。
+- `init-project <slug>` 创建并登记 L2。重复提供 `--repo-path` 可登记多个现有工作目录。共享根目录省略此参数时，以新建的 L2 目录为项目工作目录。
+- `archive <slug>` 将完成或达到约定停更周期的项目记忆和账本移入 `archive/<slug>/`，并移出 L1 项目表。归档前核对写入者、作业和证据引用。
 
-几条关键约定：
+私有记忆可放在集中目录，或放在经确认由 Git 忽略的项目内目录。凭据仅记录加载方式。个人底座可以独立做本地 Git 版本管理，原始证据和备份的访问权限按其内容管理。
 
-- 事实变了就原地替换旧说法；Live state 每次整节重写并更新时间。
-- 文件里没有流水日志，按时间顺序的经过写到报告或账本里，由 History 链接过去。
-- 超过 150 行就压缩，压缩前先在公开仓库之外留一份带日期的副本。
-- 已记录的授权只在它写明的范围内复用；范围之外的不可逆操作要先问用户。
+## 迁移现有记忆
 
-## 版本
+1. **只读盘点**。读现有技能和 `AGENTS.md`，确认每个项目的权威记忆、工作树、历史快照、账本、活跃写入者及缺失证据。列出源路径、目标路径、元数据和账本处理、备份路径，交由用户确认。
+2. **备份与迁移**。在私有目录做带日期的备份，记录源文件哈希。给 L2 加 `scope: project`、`project_id`、`status`、`repo_path`、`ledger_path` 和 `updated_at`。按真实来源整理串项目的内容，保留授权原话和限制。将可核验的外部作业补到同目录 JSONL，并保留其原始账本。将证据链接解析为新位置仍可访问的路径。为每个项目登记唯一入口并切换读写者，处理共享根遗留文件。来源缺失时记录缺口，待权威路径明确后再挂载。
+3. **验证**。运行 `validate`，检查保留的证据和原账本。用隔离工作区验证模糊启动、显式路由、目录路由、根目录隔离、作业防重、分层写回与归档。
 
-| 版本 | 说明 |
-| --- | --- |
-| `v0.1.0` | 初始版本，从实际使用中的安装目录原样上传 |
-| `main`（未打标签） | 修订版，待评审。相对 `v0.1.0`：固定了记忆文件的分节和写法；规定只有执行中的 agent 可以写；授权条目要带原话、日期和范围；回合结束时没有变化就不写；易变状态集中到 Live state 并附复核方式 |
-
+文件格式和并发写入见 [格式说明](references/format.md)，可复跑的场景见 [验收报告](tests/ACCEPTANCE.md)。

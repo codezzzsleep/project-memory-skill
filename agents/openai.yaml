@@ -1,6 +1,6 @@
 interface:
-  display_name: "Project Memory"
-  short_description: "Preserve project decisions and recovery checkpoints"
-  default_prompt: "Use $project-memory to recover the project state and checkpoint decisions before continuing."
+  display_name: "Personal Memory"
+  short_description: "Route across projects and recover verified work state"
+  default_prompt: "Use $project-memory to identify the project, verify its state, and continue the authorized work."
 policy:
   allow_implicit_invocation: true
