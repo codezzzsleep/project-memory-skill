@@ -41,9 +41,19 @@ Only the executing agent writes the selected project's memory and ledger.
 ## 日常管理
 
 - `route` 在登记目录内自动选择项目。共享根目录可传 `--project <slug>`，或让命令返回候选和优先级。已选中项目时，结果包含该项目的记忆路径和未终结作业。
-- `validate` 检查全部登记和归档，报告无效元数据、缺失文件、重复路径、超行以及共享根目录的遗留 `MEMORY.md`。
+- `validate` 检查全部登记和归档。活跃或暂停项目的 `MEMORY.md` 超过 150 行时提示先做快照再考虑精简。退出码仅在有硬错误时为非零，例如元数据无效、L0/L1 超限、路径缺失或重复、账本非法、共享根遗留 `MEMORY.md`。
 - `init-project <slug>` 创建并登记 L2。重复提供 `--repo-path` 可登记多个现有工作目录。共享根目录省略此参数时，以新建的 L2 目录为项目工作目录。
+- `update-project <slug>` 原子更新该项目的状态、优先级、摘要、阻塞点或登记目录。状态或主工作目录变动时同步更新 L2。
+- `append-job <slug>` 记录外部作业提交和状态变化，沿用作业首次记录的提交时间。
 - `archive <slug>` 将完成或达到约定停更周期的项目记忆和账本移入 `archive/<slug>/`，并移出 L1 项目表。归档前核对写入者、作业和证据引用。
+
+```bash
+python3 "$skill_dir/scripts/memory_ctl.py" --workspace-root "$workspace" update-project example \
+  --status paused --blocker 'Waiting for source data'
+python3 "$skill_dir/scripts/memory_ctl.py" --workspace-root "$workspace" append-job example \
+  --job-id job-7 --platform render-service --purpose 'Release preview' \
+  --cost-risk 'render quota' --status-query 'render-cli status job-7' --status running
+```
 
 私有记忆可放在集中目录，或放在经确认由 Git 忽略的项目内目录。凭据仅记录加载方式。个人底座可以独立做本地 Git 版本管理，原始证据和备份的访问权限按其内容管理。
 

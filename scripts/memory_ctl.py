@@ -11,7 +11,7 @@ import shutil
 import sys
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +31,7 @@ JOB_FIELDS = (
     "status_query", "status", "verified_at",
 )
 COLUMNS = ("project_id", "repo_paths", "memory_path", "status", "priority", "summary", "blocker")
+PROJECT_LINE_BUDGET = 150
 
 
 def timestamp():
@@ -91,6 +92,7 @@ def yaml_scalar(raw):
 class Document:
     path: Path
     fields: dict
+    header: list
     body: str
 
     @classmethod
@@ -98,18 +100,19 @@ class Document:
         try:
             if not path.is_file():
                 raise ValueError("expected a regular memory file")
-            lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+            with path.open(encoding="utf-8", newline="") as stream:
+                lines = stream.read().splitlines(keepends=True)
             if max_lines is not None and len(lines) > max_lines:
                 raise ValueError(f"{len(lines)} lines exceeds the {max_lines}-line limit")
-            if not lines or lines[0].rstrip("\n") != "---":
+            if not lines or lines[0].rstrip("\r\n") != "---":
                 raise ValueError("missing YAML frontmatter")
             fields = {}
             for index, line in enumerate(lines[1:], start=1):
-                if line.rstrip("\n") == "---":
+                if line.rstrip("\r\n") == "---":
                     break
                 if not line.strip() or line.lstrip().startswith("#"):
                     continue
-                match = re.fullmatch(r"([a-z][a-z0-9_]*):[ \t]+(.+)", line.rstrip("\n"))
+                match = re.fullmatch(r"([a-z][a-z0-9_]*):[ \t]+(.+)", line.rstrip("\r\n"))
                 if match is None or match[1] in fields:
                     raise ValueError(f"invalid or duplicate frontmatter key on line {index + 1}")
                 fields[match[1]] = yaml_scalar(match[2].strip())
@@ -123,12 +126,23 @@ class Document:
             check_timestamp(fields["updated_at"])
         except (OSError, ValueError) as error:
             raise ValueError(f"{path}: {error}") from error
-        return cls(path, fields, "".join(lines[index + 1:]))
+        return cls(path, fields, lines[:index + 1], "".join(lines[index + 1:]))
 
     def render(self, *, body=None, **updates):
         fields = {**self.fields, **updates, "updated_at": timestamp()}
         header = "\n".join(f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in fields.items())
         return f"---\n{header}\n---\n" + (self.body if body is None else body)
+
+    def revise(self, *, body=None, **updates):
+        updates["updated_at"] = timestamp()
+        header = []
+        for line in self.header:
+            key, _, _ = line.partition(":")
+            if key in updates:
+                ending = line[len(line.rstrip("\r\n")):]
+                line = f"{key}: {json.dumps(updates[key], ensure_ascii=False)}{ending}"
+            header.append(line)
+        return "".join(header) + (self.body if body is None else body)
 
 
 def table_row(values):
@@ -213,21 +227,46 @@ class Portfolio:
             self.end += 1
 
     def render(self, lines):
-        content = self.document.render(body="".join(lines))
+        content = self.document.revise(body="".join(lines))
         if len(content.splitlines()) > 120:
             raise ValueError("the portfolio would exceed 120 lines")
         return content
 
+    def require_project(self, slug):
+        check_slug(slug)
+        if slug in self.projects:
+            return self.projects[slug][0]
+        if (self.document.path.parent / "archive" / slug / "MEMORY.md").is_file():
+            raise ValueError(f"project is archived: {slug}")
+        raise ValueError(f"project is not registered: {slug}")
+
+    def checked_row(self, project, root):
+        row = project.row()
+        candidate = Project.from_row(row.strip(), root)
+        workdirs = set(candidate.workdirs)
+        if len(workdirs) != len(candidate.workdirs):
+            raise ValueError(f"duplicate registered work directory for {candidate.project_id}")
+        for existing, _ in self.projects.values():
+            if existing.project_id == candidate.project_id:
+                continue
+            if existing.memory_path == candidate.memory_path or workdirs.intersection(existing.workdirs):
+                raise ValueError(f"registration conflicts with {existing.project_id}")
+        return row
+
     def add(self, project, root):
-        Project.from_row(project.row().strip(), root)
         if project.project_id in self.projects:
             raise ValueError(f"project already registered: {project.project_id}")
-        for existing, _ in self.projects.values():
-            if existing.memory_path == project.memory_path or set(existing.workdirs).intersection(project.workdirs):
-                raise ValueError(f"registration conflicts with {existing.project_id}")
         lines = self.lines[:self.end]
-        lines[-1] = lines[-1].rstrip("\n") + "\n"
-        return self.render(lines + [project.row()] + self.lines[self.end:])
+        if not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += "\n"
+        return self.render(lines + [self.checked_row(project, root)] + self.lines[self.end:])
+
+    def update(self, project, root):
+        _, index = self.projects[project.project_id]
+        row = self.checked_row(project, root)
+        original = self.lines[index]
+        ending = original[len(original.rstrip("\r\n")):]
+        return self.render(self.lines[:index] + [row.rstrip("\n") + ending] + self.lines[index + 1:])
 
     def remove(self, project_id):
         _, line = self.projects[project_id]
@@ -248,27 +287,40 @@ def read_project(path, project_id, status, repo_path=None):
     return document, ledger
 
 
-def pending_jobs(path):
+def check_job_event(event, latest):
+    if not isinstance(event, dict) or not all(
+        isinstance(event.get(field), str) and event[field].strip() for field in JOB_FIELDS
+    ):
+        raise ValueError("missing or empty external job fields")
+    if event["status"] not in JOB_STATUSES:
+        raise ValueError(f"unknown job status {event['status']!r}")
+    check_timestamp(event["submitted_at"])
+    check_timestamp(event["verified_at"])
+    job_key = event["platform"], event["job_id"]
+    if job_key in latest and latest[job_key]["submitted_at"] != event["submitted_at"]:
+        raise ValueError("a job's original submitted_at changed")
+    return job_key
+
+
+def read_job_events(stream, path):
     latest = {}
-    with path.open(encoding="utf-8") as stream:
-        for number, line in enumerate(stream, start=1):
-            try:
-                event = json.loads(line)
-                if not isinstance(event, dict) or not all(
-                    isinstance(event.get(key), str) and event[key].strip() for key in JOB_FIELDS
-                ):
-                    raise ValueError("missing or empty external job fields")
-                if event["status"] not in JOB_STATUSES:
-                    raise ValueError(f"unknown job status {event['status']!r}")
-                check_timestamp(event["submitted_at"])
-                check_timestamp(event["verified_at"])
-                job_key = event["platform"], event["job_id"]
-                if job_key in latest and latest[job_key]["submitted_at"] != event["submitted_at"]:
-                    raise ValueError("a job's original submission time changed")
-                latest[job_key] = {field: event[field] for field in JOB_FIELDS}
-            except ValueError as error:
-                raise ValueError(f"{path}:{number}: {error}") from error
-    return [event for event in latest.values() if event["status"] not in TERMINAL]
+    needs_separator = False
+    for number, line in enumerate(stream, start=1):
+        try:
+            event = json.loads(line)
+            latest[check_job_event(event, latest)] = event
+        except ValueError as error:
+            raise ValueError(f"{path}:{number}: {error}") from error
+        needs_separator = not line.endswith("\n")
+    return latest, needs_separator
+
+
+def pending_jobs(path):
+    with path.open(encoding="utf-8", newline="") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+        latest, _ = read_job_events(stream, path)
+    return [{field: event[field] for field in JOB_FIELDS}
+            for event in latest.values() if event["status"] not in TERMINAL]
 
 
 @contextmanager
@@ -350,11 +402,83 @@ def init_project(root, directory, portfolio, args):
     publish_project(folder, memory, TEMPLATES / "ledger.jsonl", portfolio, registry)
 
 
+def append_job(portfolio, args):
+    project = portfolio.require_project(args.slug)
+    _, ledger = read_project(project.memory_path, project.project_id, project.status, project.workdirs[0])
+    event = {field: getattr(args, field) for field in JOB_FIELDS}
+    if args.source_ledger is not None:
+        if not args.source_ledger.strip():
+            raise ValueError("source_ledger must be nonempty")
+        event["source_ledger"] = args.source_ledger
+
+    with ledger.open("ab", buffering=0) as destination:
+        fcntl.flock(destination.fileno(), fcntl.LOCK_EX)
+        with ledger.open(encoding="utf-8", newline="") as history:
+            latest, needs_separator = read_job_events(history, ledger)
+        now = timestamp()
+        previous = latest.get((args.platform, args.job_id))
+        if args.submitted_at is None:
+            event["submitted_at"] = previous["submitted_at"] if previous else now
+        if args.verified_at is None:
+            event["verified_at"] = now
+        check_job_event(event, latest)
+
+        separator = "\n" if needs_separator else ""
+        payload = (separator + json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        original_size = os.fstat(destination.fileno()).st_size
+        try:
+            if destination.write(payload) != len(payload):
+                raise OSError(f"{ledger}: incomplete job event write")
+            destination.flush()
+            os.fsync(destination.fileno())
+        except OSError:
+            destination.truncate(original_size)
+            raise
+
+
+def update_project(root, portfolio, args):
+    fields = {name: getattr(args, name) for name in ("status", "priority", "summary", "blocker")
+              if getattr(args, name) is not None}
+    if not fields and args.add_repo_path is None and args.remove_repo_path is None:
+        raise ValueError("update-project requires at least one field or work directory change")
+
+    project = portfolio.require_project(args.slug)
+    workdirs = list(project.workdirs)
+    if args.remove_repo_path is not None:
+        path = absolute(args.remove_repo_path).resolve()
+        if path not in workdirs:
+            raise ValueError(f"work directory is not registered for {args.slug}: {path}")
+        workdirs.remove(path)
+    if args.add_repo_path is not None:
+        path = absolute(args.add_repo_path).resolve(strict=True)
+        if not path.is_dir():
+            raise ValueError(f"expected a work directory, got {path}")
+        workdirs.append(path)
+    if not workdirs:
+        raise ValueError("cannot remove the last work directory")
+
+    updated = replace(project, workdirs=tuple(workdirs), **fields)
+    registry = portfolio.update(updated, root)
+    metadata = {}
+    if updated.status != project.status:
+        metadata["status"] = updated.status
+    if updated.workdirs[0] != project.workdirs[0]:
+        metadata["repo_path"] = str(updated.workdirs[0])
+    if not metadata:
+        atomic_write(portfolio.document.path, registry)
+        return
+
+    document, _ = read_project(project.memory_path, project.project_id, project.status, project.workdirs[0])
+    atomic_write(document.path, document.revise(**metadata))
+    try:
+        atomic_write(portfolio.document.path, registry)
+    except (OSError, ValueError):
+        atomic_write(document.path, "".join(document.header) + document.body)
+        raise
+
+
 def archive_project(root, directory, portfolio, slug):
-    check_slug(slug)
-    if slug not in portfolio.projects:
-        raise ValueError(f"project is not registered: {slug}")
-    project, _ = portfolio.projects[slug]
+    project = portfolio.require_project(slug)
     document, ledger = read_project(project.memory_path, slug, project.status, project.workdirs[0])
     pending_jobs(ledger)
     folder = (directory / "archive").resolve() / slug
@@ -392,19 +516,20 @@ def route(root, portfolio, args):
 
 
 def validate(root, directory):
+    errors = []
     warnings = []
     warning = legacy_warning(root)
     if warning:
-        warnings.append(warning)
+        errors.append(warning)
     try:
         Document.read(directory / "SELF.md", "self", 50)
     except ValueError as error:
-        warnings.append(str(error))
+        errors.append(str(error))
     try:
         portfolio = Portfolio(directory / "PORTFOLIO.md", root)
     except ValueError as error:
-        warnings.append(str(error))
-        return warnings
+        errors.append(str(error))
+        return errors, warnings
     project_paths = set()
     candidates = []
     for project, _ in portfolio.projects.values():
@@ -412,21 +537,25 @@ def validate(root, directory):
         candidates.append((project.memory_path, project.project_id, project.status, project.workdirs[0]))
     for path in (directory / "projects").glob("*/MEMORY.md"):
         if path.resolve() not in project_paths:
-            warnings.append(f"unregistered project memory at {path}")
+            errors.append(f"unregistered project memory at {path}")
     for folder in (directory / "archive").glob("*"):
         if folder.is_dir():
             if folder.name in portfolio.projects:
-                warnings.append(f"archived project {folder.name!r} still appears in the registry")
+                errors.append(f"archived project {folder.name!r} still appears in the registry")
             candidates.append((folder / "MEMORY.md", folder.name, "archived", None))
     for path, slug, status, workdir in candidates:
         try:
             check_slug(slug)
             path = project_memory_path(path, root)
-            _, ledger = read_project(path, slug, status, workdir)
+            document, ledger = read_project(path, slug, status, workdir)
+            line_count = len(document.header) + len(document.body.splitlines())
+            if status != "archived" and line_count > PROJECT_LINE_BUDGET:
+                warnings.append(f"project {slug!r} at {path} has {line_count} lines (over {PROJECT_LINE_BUDGET}). "
+                                "Save a dated private snapshot, then consider condensing it.")
             pending_jobs(ledger)
         except (OSError, ValueError) as error:
-            warnings.append(str(error))
-    return warnings
+            errors.append(str(error))
+    return errors, warnings
 
 
 def main():
@@ -443,6 +572,22 @@ def main():
     init_parser.add_argument("--priority", default="unset")
     init_parser.add_argument("--summary", default="Registered")
     init_parser.add_argument("--blocker", default="-")
+    job_parser = commands.add_parser("append-job", help="append a verified external job event")
+    job_parser.add_argument("slug", metavar="project_id")
+    for field in ("job-id", "platform", "purpose", "cost-risk", "status-query"):
+        job_parser.add_argument(f"--{field}", required=True)
+    job_parser.add_argument("--status", choices=sorted(JOB_STATUSES), required=True)
+    job_parser.add_argument("--submitted-at")
+    job_parser.add_argument("--verified-at")
+    job_parser.add_argument("--source-ledger")
+    update_parser = commands.add_parser("update-project", help="update a registered project")
+    update_parser.add_argument("slug", metavar="project_id")
+    update_parser.add_argument("--status", choices=("active", "paused"))
+    update_parser.add_argument("--priority")
+    update_parser.add_argument("--summary")
+    update_parser.add_argument("--blocker")
+    update_parser.add_argument("--add-repo-path", type=Path)
+    update_parser.add_argument("--remove-repo-path", type=Path)
     commands.add_parser("archive", help="move project memory and ledger into the archive").add_argument("slug")
     args = parser.parse_args()
     try:
@@ -452,12 +597,14 @@ def main():
             init_workspace(root, directory)
             return 0
         directory = directory.resolve(strict=True)
-        with store_lock(directory, write=args.command in {"init-project", "archive"}):
+        with store_lock(directory, write=args.command in {"init-project", "update-project", "archive"}):
             if args.command == "validate":
-                warnings = validate(root, directory)
+                errors, warnings = validate(root, directory)
                 for warning in warnings:
-                    print(warning, file=sys.stderr)
-                if warnings:
+                    print(f"warning: {warning}", file=sys.stderr)
+                for error in errors:
+                    print(f"error: {error}", file=sys.stderr)
+                if errors:
                     return 1
                 print("Memory store is valid.")
                 return 0
@@ -467,6 +614,10 @@ def main():
                 print(json.dumps(route(root, portfolio, args), ensure_ascii=False))
             elif args.command == "init-project":
                 init_project(root, directory, portfolio, args)
+            elif args.command == "append-job":
+                append_job(portfolio, args)
+            elif args.command == "update-project":
+                update_project(root, portfolio, args)
             else:
                 archive_project(root, directory, portfolio, args.slug)
     except (OSError, RuntimeError, ValueError) as error:

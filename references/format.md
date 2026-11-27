@@ -38,7 +38,11 @@ Use the template's header and separator. Put one project on each contiguous tabl
 | example | ["/work/example", "/work/example-repair"] | /work/.agent-memory/projects/example/MEMORY.md | active | high | First release in review | - |
 ```
 
-Keep paused projects in the registry for deliberate selection. Directory routing applies to active projects. `route` returns `selection: choose` and active project summaries when the current directory and explicit selection yield no match. When selected, it returns the validated paths and `pending_jobs` for that project. Both cases report any legacy shared-root `MEMORY.md` without opening it. `validate` returns a nonzero exit code for findings.
+Keep paused projects in the registry for deliberate selection. Directory routing applies to active projects. `route` returns `selection: choose` and active project summaries when the current directory and explicit selection yield no match. When selected, it returns the validated paths and `pending_jobs` for that project. Both cases report any legacy shared-root `MEMORY.md` without opening it.
+
+Use `update-project <project_id>` with at least one of `--status active|paused`, `--priority`, `--summary`, `--blocker`, `--add-repo-path`, or `--remove-repo-path`. Use absolute work directories and retain at least one path. An added directory must exist and be unique in the registry. Removing the first directory promotes the next one. The command escapes table cells, refreshes the L1 timestamp, and synchronizes changes to status or the primary work directory in L2. Use `archive` for archived status.
+
+`validate` reports a `warning:` for each active or paused L2 over 150 lines. Save a dated private snapshot before condensing. Warnings alone exit with code 0. Invalid stores, including L0 or L1 over budget and an unclassified shared-root `MEMORY.md`, exit with code 1.
 
 ## External job events
 
@@ -50,8 +54,10 @@ Use one JSON object per line and append without rewriting earlier events. An emp
 
 Keep original ledgers and allow evidence pointers in events, such as `source_ledger`. Verify that a status query reads the named job and is authorized before executing it. The management script parses queries as strings. Missing job identities and untriggered work belong in the memory or linked verification report until a provider ID is known. Preserve the uncertainty of an interrupted submission and use its reference for reconciliation.
 
+Use `append-job <project_id>` with `--job-id`, `--platform`, `--purpose`, `--cost-risk`, `--status-query`, and `--status`. It takes optional `--submitted-at`, `--verified-at`, and `--source-ledger`. The first event defaults to the current UTC time for `submitted_at`. Future events inherit that exact value and reject an explicit mismatch. Omitted `verified_at` uses the current UTC time. Only registered active or paused projects accept new events.
+
 ## Write coordination
 
-The management CLI uses shared and exclusive advisory locks on the `.agent-memory` directory. For agent-managed L2 writes, hold a shared store lock after establishing that you are the project's sole writer. For editing L1, hold an exclusive store lock, reread the current version, apply the one row change, and replace the file atomically. On Linux, `flock --shared "$workspace/.agent-memory" command` and `flock --exclusive "$workspace/.agent-memory" command` use the same lock. Keep a lock only during local reads and writes. For JSONL, append complete lines, flush them before continuing, and retain the prior records.
+The management CLI uses advisory locks on `.agent-memory`. For direct L2 Markdown edits, hold a shared store lock after establishing that you are the sole writer. On Linux, use `flock --shared "$workspace/.agent-memory" command`. Hold locks only during local reads and writes. `update-project` takes an exclusive store lock and rereads the registry before writing. `append-job` takes a shared store lock and locks its ledger across history validation and the synced append. Invoke the CLI commands directly so they can acquire their locks.
 
 `init-project` and `archive` prepare the destination pair before publishing the registry update. Until then the original registry determines routing. The archive operation removes the original files after the archive and registry are published. If cleanup is interrupted, check the archive and reconcile any remaining originals before reuse. Confirm the sole writer before moving a project and preserve separate evidence files.

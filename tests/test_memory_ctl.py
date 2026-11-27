@@ -1,10 +1,13 @@
 import json
+import runpy
 import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 
 CLI = Path(__file__).resolve().parents[1] / "scripts" / "memory_ctl.py"
@@ -36,9 +39,12 @@ class MemoryStoreTests(unittest.TestCase):
         prefix = ["-c", TRACE_OPEN, str(self.root)] if traced else []
         return [sys.executable, *prefix, str(CLI), "--workspace-root", str(self.root)]
 
+    def run_command(self, arguments, *, cwd=None, traced=False):
+        return subprocess.run(self.cli(traced) + list(arguments), cwd=cwd or self.root,
+                              capture_output=True, text=True, check=False, timeout=10)
+
     def command(self, *arguments, cwd=None, code=0, traced=False):
-        result = subprocess.run(self.cli(traced) + list(arguments), cwd=cwd or self.root,
-                                capture_output=True, text=True, check=False)
+        result = self.run_command(arguments, cwd=cwd, traced=traced)
         self.assertEqual(result.returncode, code, result.stderr)
         return result
 
@@ -58,6 +64,10 @@ class MemoryStoreTests(unittest.TestCase):
         return {"job_id": job_id, "platform": "fixture", "purpose": "recovery test",
                 "submitted_at": "2026-01-01T00:00:00Z", "cost_risk": "none",
                 "status_query": query, "status": status, "verified_at": "2026-01-01T00:00:00Z"}
+
+    def append_args(self, status="submitted", *, platform="fixture", purpose="recovery test"):
+        return ("append-job", "alpha", "--job-id", "job-1", "--platform", platform, "--purpose", purpose,
+                "--cost-risk", "none", "--status-query", r"cat '/tmp/status|job\1'", "--status", status)
 
     def test_t1_shared_root_ambiguous_opens_only_resident_layers(self):
         self.register("alpha", "alpha", priority="high")
@@ -196,6 +206,196 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(original, self.portfolio.read_bytes())
         self.assertTrue((project / "MEMORY.md").is_file())
         self.assertTrue((project / "ledger.jsonl").is_file())
+
+    def test_append_job_writes_compact_utf8_and_inherits_submission_time(self):
+        ledger = self.register("alpha", "alpha") / "ledger.jsonl"
+        submitted_at = "2026-01-01T00:00:00.123+00:00"
+        purpose = "\u6e32\u67d3\nverification"
+        self.command(*self.append_args(purpose=purpose), "--submitted-at", submitted_at,
+                     "--source-ledger", "provider:original")
+        history = ledger.read_bytes()
+        first = json.loads(history)
+        self.assertEqual(first["submitted_at"], submitted_at)
+        self.assertRegex(first["verified_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertEqual(first["purpose"], purpose)
+        self.assertEqual(first["status_query"], r"cat '/tmp/status|job\1'")
+        self.assertEqual(first["source_ledger"], "provider:original")
+        self.assertEqual(history, (json.dumps(first, ensure_ascii=False, separators=(",", ":")) + "\n").encode())
+
+        verified_at = "2026-01-02T10:30:00Z"
+        self.command(*self.append_args("running"), "--verified-at", verified_at)
+        self.command(*self.append_args(platform="other-platform"))
+        contents = ledger.read_bytes()
+        self.assertTrue(contents.startswith(history))
+        running, other = map(json.loads, contents[len(history):].splitlines())
+        self.assertEqual((running["status"], running["submitted_at"], running["verified_at"]),
+                         ("running", submitted_at, verified_at))
+        self.assertEqual(other["submitted_at"], other["verified_at"])
+        self.assertEqual(other["platform"], "other-platform")
+        self.command("validate")
+
+    def test_append_job_rejects_invalid_events_without_changing_history(self):
+        ledger = self.register("alpha", "alpha") / "ledger.jsonl"
+        self.command(*self.append_args(), "--submitted-at", "2026-01-01T00:00:00Z")
+        history = ledger.read_bytes()
+        cases = [
+            (self.append_args("running") + ("--submitted-at", "2026-01-02T00:00:00Z"), 1, "original submitted_at"),
+            (self.append_args("invalid"), 2, "invalid choice"),
+            (self.append_args("running") + ("--verified-at", "2026-01-01T00:00:00+01:00"), 1, "UTC timestamp"),
+            (self.append_args(purpose=" "), 1, "empty external job fields"),
+        ]
+        for arguments, code, message in cases:
+            with self.subTest(message=message):
+                self.assertIn(message, self.command(*arguments, code=code).stderr)
+                self.assertEqual(ledger.read_bytes(), history)
+
+    def test_append_job_preserves_unterminated_history_and_rejects_archived_project(self):
+        ledger = self.register("alpha", "alpha") / "ledger.jsonl"
+        original = json.dumps(self.event("job-1", "submitted", "cat /tmp/fixture")).encode()
+        ledger.write_bytes(original)
+        self.command(*self.append_args("running"))
+        history = ledger.read_bytes()
+        self.assertTrue(history.startswith(original + b"\n"))
+        self.assertEqual(json.loads(history.splitlines()[1])["submitted_at"], "2026-01-01T00:00:00Z")
+        self.command("archive", "alpha")
+        result = self.command(*self.append_args("failed"), code=1)
+        self.assertIn("project is archived", result.stderr)
+        self.assertEqual((self.store / "archive" / "alpha" / "ledger.jsonl").read_bytes(), history)
+
+    def test_concurrent_appends_agree_on_job_identity(self):
+        ledger = self.register("alpha", "alpha") / "ledger.jsonl"
+        first = self.append_args() + ("--submitted-at", "2026-01-01T00:00:00Z")
+        second = self.append_args() + ("--submitted-at", "2026-01-02T00:00:00Z")
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            results = list(workers.map(self.run_command, (first, second)))
+        self.assertEqual(sorted(result.returncode for result in results), [0, 1])
+        self.assertIn("original submitted_at", next(result.stderr for result in results if result.returncode))
+        self.assertEqual(len(ledger.read_bytes().splitlines()), 1)
+        self.command("validate")
+
+    def test_update_project_only_changes_its_row_and_timestamp(self):
+        memory = self.register("alpha", "alpha") / "MEMORY.md"
+        self.register("beta", "beta")
+        original_memory = memory.read_bytes()
+        original_rows = self.portfolio.read_bytes().splitlines()
+        timestamp_line = next(i for i, row in enumerate(original_rows) if row.startswith(b"updated_at:"))
+        original_rows[timestamp_line] = b"updated_at: 2026-01-01T00:00:00Z"
+        self.portfolio.write_bytes(b"\r\n".join(original_rows) + b"\r\n")
+        summary = r"Release | review\smoke"
+        blocker = r"Test\gate | waiting"
+
+        self.command("update-project", "alpha", "--summary", summary, "--blocker", blocker)
+        decision = json.loads(self.command("route", "--project", "alpha").stdout)
+        self.assertEqual((decision["summary"], decision["blocker"]), (summary, blocker))
+        self.assertEqual(memory.read_bytes(), original_memory)
+        rows = self.portfolio.read_bytes().split(b"\r\n")
+        self.assertEqual(len(rows), len(original_rows) + 1)
+        changed = [i for i, (old, new) in enumerate(zip(original_rows, rows)) if old != new]
+        alpha_line = next(i for i, row in enumerate(original_rows) if row.startswith(b"| alpha |"))
+        self.assertEqual(changed, [timestamp_line, alpha_line])
+        self.assertIn(rb"Release \| review\\smoke", rows[alpha_line])
+        self.assertIn(rb"Test\\gate \| waiting", rows[alpha_line])
+
+    def test_update_project_syncs_pause_resume_and_primary_directory(self):
+        memory = self.register("alpha", "alpha", "secondary") / "MEMORY.md"
+        original = memory.read_text()
+        self.command("update-project", "alpha", "--status", "paused",
+                     "--remove-repo-path", str(self.root / "alpha"))
+        paused = memory.read_text()
+        self.assertIn('status: "paused"', paused)
+        self.assertIn(f'repo_path: "{self.root / "secondary"}"', paused)
+        self.assertEqual(paused.split("\n---\n", 1)[1], original.split("\n---\n", 1)[1])
+        self.assertEqual(json.loads(self.command("route", cwd=self.root / "secondary").stdout)["selection"], "choose")
+        self.assertEqual(json.loads(self.command("route", "--project", "alpha").stdout)["selection"], "selected")
+        self.command("validate")
+
+        workdir = self.root / "next-worktree"
+        workdir.mkdir()
+        self.command("update-project", "alpha", "--status", "active", "--add-repo-path", str(workdir),
+                     "--remove-repo-path", str(self.root / "secondary"))
+        self.assertIn('status: "active"', memory.read_text())
+        self.assertIn(f'repo_path: "{workdir}"', memory.read_text())
+        self.assertEqual(json.loads(self.command("route", cwd=workdir).stdout)["project_id"], "alpha")
+        self.command("validate")
+
+    def test_update_project_rejects_invalid_status_and_paths(self):
+        memory = self.register("alpha", "alpha") / "MEMORY.md"
+        self.register("beta", "beta")
+        alias = self.root / "beta-alias"
+        alias.symlink_to(self.root / "beta", target_is_directory=True)
+        before = self.portfolio.read_bytes(), memory.read_bytes()
+        cases = [
+            ((), 1, "at least one"),
+            (("--status", "archived"), 2, "invalid choice"),
+            (("--add-repo-path", str(alias)), 1, "registration conflicts with beta"),
+            (("--add-repo-path", "beta"), 1, "expected an absolute path"),
+            (("--add-repo-path", str(self.root / "absent")), 1, "No such file or directory"),
+            (("--remove-repo-path", str(self.root / "alpha")), 1, "last work directory"),
+        ]
+        for options, code, message in cases:
+            with self.subTest(options=options):
+                self.assertIn(message, self.command("update-project", "alpha", *options, code=code).stderr)
+                self.assertEqual((self.portfolio.read_bytes(), memory.read_bytes()), before)
+
+    def test_concurrent_project_updates_keep_both_rows_and_fields(self):
+        self.register("alpha", "alpha")
+        self.register("beta", "beta")
+        commands = [
+            ("update-project", "alpha", "--priority", "high"),
+            ("update-project", "alpha", "--summary", "Reviewed"),
+            ("update-project", "beta", "--blocker", "Awaiting data"),
+        ]
+        with ThreadPoolExecutor(max_workers=3) as workers:
+            results = list(workers.map(self.run_command, commands))
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        entries = {entry["project_id"]: entry for entry in json.loads(self.command("route").stdout)["active_projects"]}
+        self.assertEqual((entries["alpha"]["priority"], entries["alpha"]["summary"]), ("high", "Reviewed"))
+        self.assertEqual(entries["beta"]["blocker"], "Awaiting data")
+        self.command("validate")
+
+    def test_update_project_restores_memory_if_registry_write_fails(self):
+        memory = self.register("alpha", "alpha") / "MEMORY.md"
+        before = self.portfolio.read_bytes(), memory.read_bytes()
+        main = runpy.run_path(str(CLI))["main"]
+        atomic_write = main.__globals__["atomic_write"]
+
+        def fail_portfolio_write(path, content):
+            if path == self.portfolio:
+                raise OSError("fixture registry write failure")
+            atomic_write(path, content)
+
+        argv = [str(CLI), "--workspace-root", str(self.root), "update-project", "alpha", "--status", "paused"]
+        with patch.object(sys, "argv", argv), patch.dict(main.__globals__, atomic_write=fail_portfolio_write):
+            with patch("sys.stderr") as stderr:
+                self.assertEqual(main(), 1)
+                stderr.write.assert_any_call("memory_ctl: fixture registry write failure")
+        self.assertEqual((self.portfolio.read_bytes(), memory.read_bytes()), before)
+        self.command("validate")
+
+    def test_validate_l2_line_warning_is_nonblocking_and_keeps_hard_error_exit(self):
+        project = self.register("alpha", "alpha")
+        memory = project / "MEMORY.md"
+        lines = len(memory.read_text().splitlines())
+        with memory.open("a", encoding="utf-8") as stream:
+            stream.write("line\n" * (150 - lines))
+        self.assertEqual(self.command("validate").stderr, "")
+        with memory.open("a", encoding="utf-8") as stream:
+            stream.write("one more line\n")
+
+        warning = self.command("validate").stderr
+        self.assertIn(f"warning: project 'alpha' at {memory} has 151 lines", warning)
+        self.assertIn("Save a dated private snapshot", warning)
+        self.command("update-project", "alpha", "--status", "paused")
+        self.assertEqual(self.command("validate").stderr, warning)
+        ledger = project / "ledger.jsonl"
+        ledger.write_text('{"job_id":"incomplete"}\n', encoding="utf-8")
+        result = self.command("validate", code=1)
+        self.assertIn(warning, result.stderr)
+        self.assertIn(f"error: {ledger}:1: missing or empty external job fields", result.stderr)
+        ledger.write_text("", encoding="utf-8")
+        self.command("archive", "alpha")
+        self.assertEqual(self.command("validate").stderr, "")
 
 
 if __name__ == "__main__":
